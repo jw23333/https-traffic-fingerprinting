@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+dataset_raw/
+dataset_pairs/
+pairs_metadata.csv
+models/rf_model.joblib
+*.pcap
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
