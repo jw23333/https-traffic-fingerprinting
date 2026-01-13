@@ -26,35 +26,31 @@ from process_dataset_pairs import summary_features
 
 def analyze_site_variance(site_dir: Path, site_name: str) -> Dict:
     """Analyze variance in traffic patterns for a single site."""
-    pcap_files = sorted(site_dir.glob("*.pcap"))
+    # Look for pairs CSV files instead of raw pcaps (more efficient)
+    pairs_files = sorted(site_dir.glob("*_pairs.csv"))
     
-    if not pcap_files:
+    if not pairs_files:
         return None
     
     pair_counts = []
     feature_values = []
     
-    for pcap_path in pcap_files:
+    for pairs_path in pairs_files:
         try:
-            # Get pairs without writing to disk
-            pairs = get_pairs_from_pcap(
-                pcap_path=str(pcap_path),
-                iface="en1",
-                gap_ms=50.0
-            )
+            # Read pairs CSV directly (already processed)
+            df = pd.read_csv(pairs_path)
             
-            if not pairs:
+            if df.empty:
                 continue
                 
-            # Convert to DataFrame and extract features
-            df = pd.DataFrame(pairs)
+            # Extract features from pairs
             feats = summary_features(df)
             
-            pair_counts.append(len(pairs))
+            pair_counts.append(len(df))
             feature_values.append(feats)
             
         except Exception as e:
-            print(f"  [!] Error processing {pcap_path.name}: {e}", file=sys.stderr)
+            print(f"  [!] Error processing {pairs_path.name}: {e}", file=sys.stderr)
             continue
     
     if not pair_counts:
@@ -193,13 +189,17 @@ def compare_sites(stats: List[Dict]):
 
 
 def main():
-    dataset_dir = Path("dataset_raw")
+    # Use absolute path based on script location, not current working directory
+    script_dir = Path(__file__).parent.resolve()
+    dataset_dir = script_dir / "dataset_pairs"
     
     if not dataset_dir.exists():
         print(f"Error: {dataset_dir} not found")
+        print(f"Script location: {script_dir}")
+        print("Make sure you've run: python build_pairs_dataset.py")
         sys.exit(1)
     
-    print("Analyzing data quality from dataset_raw...")
+    print("Analyzing data quality from dataset_pairs...")
     print("This may take a minute for large datasets...\n")
     
     stats = []
