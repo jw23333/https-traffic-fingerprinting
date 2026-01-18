@@ -40,15 +40,31 @@ DATASET_DIR = PROJECT_DIR / "dataset_raw"
 
 # Sites to visit. Use full URL strings.
 # Chosen for diverse, relatively stable traffic patterns.
+# MONITORED sites (will be used for actual monitoring):
+#   - wikipedia.org (lightweight)
+#   - npmjs.com (medium, package index)
+# DECOY sites (trained to distinguish from monitored sites, not used for monitoring):
+#   - apple.com (medium, product site)
+#   - youtube.com (heavy, video platform)
+#   - reuters.com (medium, news)
 SITES: List[str] = [
-    "https://www.wikipedia.org",      # light, very distinct
-    "https://docs.python.org",         # very light docs, distinct
-    "https://www.reuters.com",         # medium news (lighter than BBC)
-    "https://www.npmjs.com",                # medium package index (distinct from news/docs)
-    "https://medium.com",              # medium blog platform
+    "https://www.wikipedia.org",      # MONITORED: lightweight
+    "https://www.npmjs.com",          # MONITORED: medium (packages)
+    "https://www.github.com",         # DECOY: medium (code repo)
+    "https://www.youtube.com",        # DECOY: heavy (video)
+    "https://news.ycombinator.com",   # DECOY: lightweight+ (news)
 ]
 
-VISITS_PER_SITE = 50
+# Different visit counts for monitored vs decoy sites
+VISITS_MONITORED = 70      # 70 visits for wikipedia and npmjs (more data = better learning)
+VISITS_DECOY = 30          # 30 visits for decoys (enough to distinguish, less collection time)
+
+# Determine visits per site based on whether it's monitored
+MONITORED_SITES = {"https://www.wikipedia.org", "https://www.npmjs.com"}
+
+def get_visits_for_site(site_url: str) -> int:
+    """Return number of visits for this site (70 for monitored, 30 for decoys)."""
+    return VISITS_MONITORED if site_url in MONITORED_SITES else VISITS_DECOY
 CAPTURE_SECONDS = 2.5
 # Seconds to wait after opening the site before starting capture (if start_before_visit=False)
 DELAY_BEFORE_CAPTURE = 0.3
@@ -157,9 +173,13 @@ def run_collection(sites: List[str] = SITES):
         site_dir = DATASET_DIR / site_name
         site_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n=== Collecting for site: {site} ({site_dir}) ===")
+        visits_for_this_site = get_visits_for_site(site)
+        site_type = "MONITORED" if site in MONITORED_SITES else "DECOY"
+        
+        print(f"\n=== Collecting for site: {site} ({site_dir}) [{site_type}] ===")
+        print(f"    Will collect {visits_for_this_site} visits")
 
-        for i in range(1, VISITS_PER_SITE + 1):
+        for i in range(1, visits_for_this_site + 1):
             capture_visit(site, site_dir, i)
             time.sleep(DELAY_BETWEEN_VISITS)
 

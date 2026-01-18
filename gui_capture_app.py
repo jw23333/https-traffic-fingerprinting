@@ -49,6 +49,17 @@ class CaptureApp(tk.Tk):
         # Cleanup toggle: remove pcap/pairs/csv after prediction
         self.cleanup_after_predict = True
 
+        # Confidence cutoff for monitored-site detection (abstain below this)
+        self.confidence_threshold = 0.65
+        
+        # Margin threshold: reject if top-1 and top-2 probabilities are too close
+        # Helps prevent false positives when model is unsure between similar sites
+        self.margin_threshold = 0.20
+        
+        # Optional: only accept predictions for these specific labels (None = all trained labels)
+        # Example: {"wikipedia_org", "npmjs_com"} to ignore decoy sites
+        self.monitored_labels: set[str] | None = {"wikipedia_org", "npmjs_com"}
+
         # UI elements
         self.status_var = tk.StringVar(value="Ready")
         self.status_label = tk.Label(self, textvariable=self.status_var, width=50, anchor="w")
@@ -161,9 +172,15 @@ class CaptureApp(tk.Tk):
             y_pred = clf.predict(X)[0]
             label = le.inverse_transform([y_pred])[0]
             proba = None
+            proba_top2 = None
+            margin = None
             try:
                 probas = clf.predict_proba(X)[0]
-                proba = float(np.max(probas))
+                # Get top-1 and top-2 probabilities for margin check
+                sorted_probas = np.sort(probas)[::-1]
+                proba = float(sorted_probas[0])
+                proba_top2 = float(sorted_probas[1]) if len(sorted_probas) > 1 else 0.0
+                margin = proba - proba_top2
             except Exception:
                 pass
 
@@ -177,8 +194,8 @@ class CaptureApp(tk.Tk):
                 'value': X.iloc[0].values
             }).sort_values('importance', ascending=False)
             
-            # Build detailed analysis text
-            analysis = self._build_feature_analysis(label, proba, importance_df)
+            # Build detailed analysis text (includes accept/reject decision)
+            analysis = self._build_feature_analysis(label, proba, margin, importance_df)
             self.after(0, lambda: self._display_analysis(analysis))
 
             # Optional cleanup of files after prediction
@@ -190,23 +207,77 @@ class CaptureApp(tk.Tk):
                 except Exception:
                     cleaned = False
 
-            if proba is not None:
-                base = f"Prediction: {label} (confidence {proba:.2f})"
+            # Decide whether to accept or reject the prediction
+            # Check: confidence threshold, margin threshold, AND monitored label set
+            accepted = True
+            reject_reason = None
+            
+            if proba is None:
+                accepted = True  # No probabilities available, accept by default
+            elif self.monitored_labels is not None and label not in self.monitored_labels:
+                accepted = False
+                reject_reason = f"'{label}' not in monitored sites"
+            elif proba < self.confidence_threshold:
+                accepted = False
+                reject_reason = f"low confidence ({proba:.1%} < {self.confidence_threshold:.0%})"
+            elif margin is not None and margin < self.margin_threshold:
+                accepted = False
+                reject_reason = f"ambiguous ({proba:.1%} vs {proba_top2:.1%}, margin {margin:.1%} < {self.margin_threshold:.0%})"
+            
+            if accepted:
+                if proba is not None:
+                    base = f"Prediction: {label} (confidence {proba:.2f})"
+                else:
+                    base = f"Prediction: {label}"
             else:
-                base = f"Prediction: {label}"
+                base = f"No monitored site detected ({reject_reason})"
             msg = base + (" — cleaned up" if cleaned else f" — pairs: {pairs_path}")
             self.after(0, lambda: self.status_var.set(msg))
 
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Prediction error", str(e)))
 
-    def _build_feature_analysis(self, label: str, proba: float | None, importance_df: pd.DataFrame) -> str:
+    def _build_feature_analysis(self, label: str, proba: float | None, margin: float | None, importance_df: pd.DataFrame) -> str:
         """Build detailed feature analysis text showing what drove the classification."""
         lines = []
         lines.append("=" * 80)
-        lines.append(f"CLASSIFICATION RESULT: {label}")
-        if proba is not None:
-            lines.append(f"Confidence: {proba:.1%}")
+        # Show classification result and whether it's accepted or rejected
+        accepted = True
+        if proba is None:
+            accepted = True
+        elif self.monitored_labels is not None and label not in self.monitored_labels:
+            accepted = False
+        elif proba < self.confidence_threshold:
+            accepted = False
+        elif margin is not None and margin < self.margin_threshold:
+            accepted = False
+            
+        if accepted:
+            lines.append(f"CLASSIFICATION RESULT: {label}")
+            if proba is not None:
+                lines.append(f"Confidence: {proba:.1%}")
+            if margin is not None:
+                lines.append(f"Margin (top1-top2): {margin:.1%}")
+            lines.append(f"Decision: ACCEPTED")
+        else:
+            lines.append(f"CLASSIFICATION RESULT: {label}")
+            if proba is not None:
+                lines.append(f"Confidence: {proba:.1%}")
+            if margin is not None:
+                lines.append(f"Margin (top1-top2): {margin:.1%}")
+            
+            # Determine rejection reason
+            reasons = []
+            if self.monitored_labels is not None and label not in self.monitored_labels:
+                reasons.append(f"'{label}' not monitored")
+            if proba is not None and proba < self.confidence_threshold:
+                reasons.append(f"confidence < {self.confidence_threshold:.0%}")
+            if margin is not None and margin < self.margin_threshold:
+                reasons.append(f"margin < {self.margin_threshold:.0%}")
+            if margin is not None and margin < self.margin_threshold:
+                reasons.append(f"margin < {self.margin_threshold:.0%}")
+            reason_text = ", ".join(reasons)
+            lines.append(f"Decision: REJECTED ({reason_text})")
         lines.append("=" * 80)
         lines.append("")
         
