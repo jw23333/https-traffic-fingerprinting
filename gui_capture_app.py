@@ -21,20 +21,83 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import joblib
+import subprocess
 
 from capture_safari_all import start_capture, stop_capture, DEFAULT_OUT_DIR
 from process_pcap import process_pcap
 from process_dataset_pairs import read_pairs_csv, summary_features
 
 
+def detect_wifi_interface(default: str = "en0") -> str:
+    """Return the Wi‑Fi interface name by querying macOS, fallback to default.
+
+    Uses `networksetup -listallhardwareports` and looks for the "Hardware Port: Wi-Fi"
+    block, returning the following "Device: <name>" line. If anything fails, returns
+    the provided default (en0).
+    """
+    try:
+        proc = subprocess.run(
+            ["networksetup", "-listallhardwareports"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        lines = proc.stdout.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip().lower() == "hardware port: wi-fi":
+                # Next lines should contain Device: <iface>
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    if lines[j].strip().lower().startswith("device:"):
+                        parts = lines[j].split(":", 1)
+                        if len(parts) == 2:
+                            candidate = parts[1].strip()
+                            if candidate:
+                                return candidate
+                break
+    except Exception:
+        # Ignore and fall back
+        pass
+    return default
+
+
+def check_capture_permission(interface: str) -> None:
+    """Run a tiny tshark probe to see if we can capture on the interface.
+
+    Raises RuntimeError with stderr if permissions are insufficient.
+    """
+    try:
+        proc = subprocess.run(
+            ["tshark", "-i", interface, "-c", "1"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("tshark not found. Install via: brew install wireshark")
+    except subprocess.TimeoutExpired:
+        # If it hangs, let the main capture proceed; we only wanted a quick check.
+        return
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip() if proc.stderr else ""
+        raise RuntimeError(
+            "tshark permission check failed on interface '"
+            + interface
+            + "'.\n\n"
+            + (stderr or "Unknown error")
+            + "\n\nFix: run the Wireshark GrantPermissions helper (Homebrew) or temporarily run the app with sudo."
+        )
+
+
 class CaptureApp(tk.Tk):
-    def __init__(self, interface: str = "en1", out_dir: str | None = None):
+    def __init__(self, interface: str | None = None, out_dir: str | None = None):
         super().__init__()
         self.title("HTTPS Capture")
         self.resizable(True, True)
 
         # Defaults and state
-        self.interface = interface
+        # Hardcode interface (change manually per machine to avoid slow detection)
+        self.interface = interface or "en0"
         # Default to the project directory if not provided
         self.out_dir = os.path.expanduser(out_dir) if out_dir else DEFAULT_OUT_DIR
         self.proc = None
@@ -90,6 +153,9 @@ class CaptureApp(tk.Tk):
             print("Capture process already started")
             return
         try:
+            # Quick permission probe to give a clear error before starting
+            check_capture_permission(self.interface)
+
             self.proc, self.pcap_path = start_capture(
                 interface=self.interface,
                 out_dir=self.out_dir,
@@ -102,6 +168,8 @@ class CaptureApp(tk.Tk):
             self.btn_stop.config(state=tk.NORMAL)
         except FileNotFoundError as e:
             messagebox.showerror("tshark not found", str(e))
+        except RuntimeError as e:
+            messagebox.showerror("Capture permission", str(e))
         except Exception as e:
             messagebox.showerror("Error starting capture", str(e))
 
@@ -128,14 +196,22 @@ class CaptureApp(tk.Tk):
             # Update UI: processing started
             self.after(0, lambda: self.status_var.set("Processing capture → features → prediction…"))
 
+            # Guard: ensure pcap exists before processing
+            if not os.path.exists(pcap_path):
+                raise FileNotFoundError(f"PCAP not found: {pcap_path}")
+
             # 1) Process pcap into burst pairs CSV (uses default pairs path next to pcap)
-            _, pairs_path = process_pcap(
-                pcap_path=pcap_path,
-                iface=self.interface,
-                packets_csv=None,
-                pairs_csv=None,
-                gap_ms=50.0,
-            )
+            try:
+                _, pairs_path = process_pcap(
+                    pcap_path=pcap_path,
+                    iface=self.interface,
+                    packets_csv=None,
+                    pairs_csv=None,
+                    gap_ms=50.0,
+                )
+            except subprocess.CalledProcessError as cpe:
+                stderr = cpe.stderr if hasattr(cpe, 'stderr') else ''
+                raise RuntimeError(f"tshark failed: {cpe}. {stderr}")
 
             # 2) Build a single-row feature DataFrame (summary mode)
             df = read_pairs_csv(Path(pairs_path))
@@ -235,7 +311,9 @@ class CaptureApp(tk.Tk):
             self.after(0, lambda: self.status_var.set(msg))
 
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Prediction error", str(e)))
+            err_msg = str(e)
+            # Use a default argument to capture the message; exception vars are cleared after except
+            self.after(0, lambda msg=err_msg: messagebox.showerror("Prediction error", msg))
 
     def _build_feature_analysis(self, label: str, proba: float | None, margin: float | None, importance_df: pd.DataFrame) -> str:
         """Build detailed feature analysis text showing what drove the classification."""
@@ -341,5 +419,5 @@ class CaptureApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = CaptureApp(interface="en1")
+    app = CaptureApp(interface=None)  # auto-detect Wi‑Fi interface
     app.mainloop()

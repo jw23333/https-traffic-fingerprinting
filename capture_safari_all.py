@@ -170,9 +170,21 @@ def start_capture(interface: str,
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,  # capture errors so we can report permission issues
         preexec_fn=os.setsid,  # create a new session/process group (POSIX/macOS)
+        text=True,
     )
+
+    # If tshark dies immediately (e.g., due to permissions), surface the error now.
+    try:
+        proc_ret = proc.wait(timeout=0.3)
+    except subprocess.TimeoutExpired:
+        # Still running; that’s fine.
+        return proc, pcap_path
+
+    # If we get here, the process exited too soon — raise with stderr contents.
+    stderr_out = proc.stderr.read() if proc.stderr else ""
+    raise RuntimeError(f"tshark exited early with code {proc_ret}. Stderr: {stderr_out.strip()}")
     return proc, pcap_path
 
 
