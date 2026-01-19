@@ -44,15 +44,17 @@ DATASET_DIR = PROJECT_DIR / "dataset_raw"
 #   - wikipedia.org (lightweight)
 #   - npmjs.com (medium, package index)
 # DECOY sites (trained to distinguish from monitored sites, not used for monitoring):
-#   - apple.com (medium, product site)
+#   - github.com (medium, code repo)
 #   - youtube.com (heavy, video platform)
-#   - reuters.com (medium, news)
+#   - news.ycombinator.com (lightweight, news/discussion)
+#   - docs.python.org (lightweight, static docs) — added to distinguish from wikipedia/ycombinator
 SITES: List[str] = [
     "https://www.wikipedia.org",      # MONITORED: lightweight
     "https://www.npmjs.com",          # MONITORED: medium (packages)
     "https://www.github.com",         # DECOY: medium (code repo)
     "https://www.youtube.com",        # DECOY: heavy (video)
-    "https://news.ycombinator.com",   # DECOY: lightweight+ (news)
+    "https://news.ycombinator.com",   # DECOY: lightweight (news/discussion)
+    "https://docs.python.org",        # DECOY: lightweight (static docs) — helps model distinguish lightweight sites
 ]
 
 # Different visit counts for monitored vs decoy sites
