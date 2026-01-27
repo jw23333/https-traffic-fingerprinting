@@ -204,8 +204,10 @@ class CaptureApp(tk.Tk):
                 try:
                     self._cleanup_files(pcap_path, pairs_path)
                     cleaned = True
-                except Exception:
+                    print(f"[Cleanup] Deleted: {pcap_path}, {pairs_path}")
+                except Exception as e:
                     cleaned = False
+                    print(f"[Cleanup] Failed: {e}")
 
             # Decide whether to accept or reject the prediction
             # Check: confidence threshold, margin threshold, AND monitored label set
@@ -260,24 +262,14 @@ class CaptureApp(tk.Tk):
                 lines.append(f"Margin (top1-top2): {margin:.1%}")
             lines.append(f"Decision: ACCEPTED")
         else:
-            lines.append(f"CLASSIFICATION RESULT: {label}")
-            if proba is not None:
-                lines.append(f"Confidence: {proba:.1%}")
-            if margin is not None:
-                lines.append(f"Margin (top1-top2): {margin:.1%}")
-            
-            # Determine rejection reason
-            reasons = []
-            if self.monitored_labels is not None and label not in self.monitored_labels:
-                reasons.append(f"'{label}' not monitored")
-            if proba is not None and proba < self.confidence_threshold:
-                reasons.append(f"confidence < {self.confidence_threshold:.0%}")
-            if margin is not None and margin < self.margin_threshold:
-                reasons.append(f"margin < {self.margin_threshold:.0%}")
-            if margin is not None and margin < self.margin_threshold:
-                reasons.append(f"margin < {self.margin_threshold:.0%}")
-            reason_text = ", ".join(reasons)
-            lines.append(f"Decision: REJECTED ({reason_text})")
+            lines.append(f"NO MONITORED SITE DETECTED")
+            lines.append(f"Decision: REJECTED")
+            lines.append("")
+            lines.append("Monitored sites:")
+            for site in sorted(self.monitored_labels or []):
+                lines.append(f"  • {site}")
+            lines.append("=" * 80)
+            return "\n".join(lines)
         lines.append("=" * 80)
         lines.append("")
         
