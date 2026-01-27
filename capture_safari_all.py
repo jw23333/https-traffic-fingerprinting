@@ -30,7 +30,7 @@ import signal                  # to send signals when stopping background captur
 
 # ----------------------------- Constants -----------------------------
 # Default capture interface (Wi‑Fi on this Mac). You can override via CLI.
-DEFAULT_INTERFACE = "en1"  # run `tshark -D` to list interfaces on your system
+DEFAULT_INTERFACE = "en1"  # Default capture interface (Studio); set to en0 on MacBook when needed
 
 # Default capture duration in seconds; change with --seconds on CLI.
 DEFAULT_SECONDS = 10

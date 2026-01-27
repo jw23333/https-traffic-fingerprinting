@@ -6,7 +6,7 @@ A minimal Tkinter GUI for starting and stopping HTTPS captures using tshark.
 - Stop:  stops the capture cleanly; shows where the .pcap was saved
 
 Defaults for this demo:
-- interface: "en1"
+- interface: "en0" (MacBook Wi‑Fi)
 - out_dir:   Project directory (same folder as these scripts)
 
 You can extend this later with a timer, live packet counter, or a folder picker.
@@ -28,13 +28,14 @@ from process_dataset_pairs import read_pairs_csv, summary_features
 
 
 class CaptureApp(tk.Tk):
-    def __init__(self, interface: str = "en1", out_dir: str | None = None):
+    def __init__(self, interface: str | None = None, out_dir: str | None = None):
         super().__init__()
         self.title("HTTPS Capture")
         self.resizable(True, True)
 
         # Defaults and state
-        self.interface = interface
+        # Hardcode interface (change manually per machine). MacBook Wi‑Fi is usually en0.
+        self.interface = interface or "en0"
         # Default to the project directory if not provided
         self.out_dir = os.path.expanduser(out_dir) if out_dir else DEFAULT_OUT_DIR
         self.proc = None
@@ -89,39 +90,73 @@ class CaptureApp(tk.Tk):
         if self.proc is not None and self.proc.poll() is None:
             print("Capture process already started")
             return
+        # Disable button immediately for instant feedback
+        self.btn_start.config(state=tk.DISABLED)
+        self.status_var.set("Starting capture…")
+        # Run start_capture in background to avoid blocking UI
+        threading.Thread(target=self._start_capture_thread, daemon=True).start()
+
+    def _start_capture_thread(self):
         try:
-            self.proc, self.pcap_path = start_capture(
+            proc, pcap_path = start_capture(
                 interface=self.interface,
                 out_dir=self.out_dir,
                 prefix="safari",
                 duration=None,
                 fixed=False,
             )
-            self.status_var.set("Capturing…")
-            self.btn_start.config(state=tk.DISABLED)
-            self.btn_stop.config(state=tk.NORMAL)
+            # Update UI on main thread
+            self.after(0, lambda: self._on_start_success(proc, pcap_path))
         except FileNotFoundError as e:
-            messagebox.showerror("tshark not found", str(e))
+            err_msg = str(e)
+            self.after(0, lambda msg=err_msg: self._on_start_error("tshark not found", msg))
         except Exception as e:
-            messagebox.showerror("Error starting capture", str(e))
+            err_msg = str(e)
+            self.after(0, lambda msg=err_msg: self._on_start_error("Error starting capture", msg))
+
+    def _on_start_success(self, proc, pcap_path):
+        self.proc = proc
+        self.pcap_path = pcap_path
+        self.status_var.set("Capturing…")
+        self.btn_stop.config(state=tk.NORMAL)
+
+    def _on_start_error(self, title, message):
+        messagebox.showerror(title, message)
+        self.btn_start.config(state=tk.NORMAL)
+        self.status_var.set("Ready")
 
     def on_stop(self):
         if self.proc is None:
             return
-        try:
-            stop_capture(self.proc)
-            self.status_var.set(f"Stopped — saved to {self.pcap_path}")
-        except Exception as e:
-            messagebox.showerror("Error stopping capture", str(e))
-        finally:
-            self.btn_start.config(state=tk.NORMAL)
-            self.btn_stop.config(state=tk.DISABLED)
-            self.proc = None
-            # keep self.pcap_path for the saved location display
+        # Disable button immediately and save state
+        self.btn_stop.config(state=tk.DISABLED)
+        self.status_var.set("Stopping capture…")
+        proc = self.proc
+        pcap_path = self.pcap_path
+        self.proc = None  # Clear immediately to prevent double-stop
+        # Run stop in background to avoid blocking UI
+        threading.Thread(target=self._stop_capture_thread, args=(proc, pcap_path), daemon=True).start()
 
+    def _stop_capture_thread(self, proc, pcap_path):
+        try:
+            stop_capture(proc)
+            # Update UI on main thread
+            self.after(0, lambda path=pcap_path: self._on_stop_success(path))
+        except Exception as e:
+            err_msg = str(e)
+            self.after(0, lambda msg=err_msg: self._on_stop_error(msg))
+
+    def _on_stop_success(self, pcap_path):
+        self.status_var.set(f"Stopped — saved to {pcap_path}")
+        self.btn_start.config(state=tk.NORMAL)
         # Process the pcap and run a prediction in background
-        if self.pcap_path:
-            threading.Thread(target=self._process_and_predict, args=(self.pcap_path,), daemon=True).start()
+        if pcap_path:
+            threading.Thread(target=self._process_and_predict, args=(pcap_path,), daemon=True).start()
+
+    def _on_stop_error(self, message):
+        messagebox.showerror("Error stopping capture", message)
+        self.btn_start.config(state=tk.NORMAL)
+        self.status_var.set("Error stopping capture")
 
     def _process_and_predict(self, pcap_path: str):
         try:
@@ -237,7 +272,8 @@ class CaptureApp(tk.Tk):
             self.after(0, lambda: self.status_var.set(msg))
 
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Prediction error", str(e)))
+            err_msg = str(e)
+            self.after(0, lambda msg=err_msg: messagebox.showerror("Prediction error", msg))
 
     def _build_feature_analysis(self, label: str, proba: float | None, margin: float | None, importance_df: pd.DataFrame) -> str:
         """Build detailed feature analysis text showing what drove the classification."""
@@ -333,5 +369,6 @@ class CaptureApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = CaptureApp(interface="en1")
+    # Use MacBook Wi‑Fi interface by default; change to en1 on Mac Studio.
+    app = CaptureApp(interface="en0")
     app.mainloop()
