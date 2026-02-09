@@ -6,7 +6,7 @@ A minimal Tkinter GUI for starting and stopping HTTPS captures using tshark.
 - Stop:  stops the capture cleanly; shows where the .pcap was saved
 
 Defaults for this demo:
-- interface: "en0" (MacBook Wi‑Fi)
+- interface: "en1"
 - out_dir:   Project directory (same folder as these scripts)
 
 You can extend this later with a timer, live packet counter, or a folder picker.
@@ -28,14 +28,13 @@ from process_dataset_pairs import read_pairs_csv, summary_features
 
 
 class CaptureApp(tk.Tk):
-    def __init__(self, interface: str | None = None, out_dir: str | None = None):
+    def __init__(self, interface: str = "en1", out_dir: str | None = None):
         super().__init__()
         self.title("HTTPS Capture")
         self.resizable(True, True)
 
         # Defaults and state
-        # Hardcode interface (change manually per machine). MacBook Wi‑Fi is usually en0.
-        self.interface = interface or "en0"
+        self.interface = interface
         # Default to the project directory if not provided
         self.out_dir = os.path.expanduser(out_dir) if out_dir else DEFAULT_OUT_DIR
         self.proc = None
@@ -51,15 +50,15 @@ class CaptureApp(tk.Tk):
         self.cleanup_after_predict = True
 
         # Confidence cutoff for monitored-site detection (abstain below this)
-        self.confidence_threshold = 0.65
+        self.confidence_threshold = 0.5
         
         # Margin threshold: reject if top-1 and top-2 probabilities are too close
         # Helps prevent false positives when model is unsure between similar sites
         self.margin_threshold = 0.20
         
         # Optional: only accept predictions for these specific labels (None = all trained labels)
-        # Example: {"wikipedia_org", "npmjs_com"} to ignore decoy sites
-        self.monitored_labels: set[str] | None = {"wikipedia_org", "npmjs_com"}
+        # Example: {"chickenpox", "measles"} to ignore decoy sites
+        self.monitored_labels: set[str] | None = {"chickenpox", "measles"}
 
         # UI elements
         self.status_var = tk.StringVar(value="Ready")
@@ -90,73 +89,39 @@ class CaptureApp(tk.Tk):
         if self.proc is not None and self.proc.poll() is None:
             print("Capture process already started")
             return
-        # Disable button immediately for instant feedback
-        self.btn_start.config(state=tk.DISABLED)
-        self.status_var.set("Starting capture…")
-        # Run start_capture in background to avoid blocking UI
-        threading.Thread(target=self._start_capture_thread, daemon=True).start()
-
-    def _start_capture_thread(self):
         try:
-            proc, pcap_path = start_capture(
+            self.proc, self.pcap_path = start_capture(
                 interface=self.interface,
                 out_dir=self.out_dir,
                 prefix="safari",
                 duration=None,
                 fixed=False,
             )
-            # Update UI on main thread
-            self.after(0, lambda: self._on_start_success(proc, pcap_path))
+            self.status_var.set("Capturing…")
+            self.btn_start.config(state=tk.DISABLED)
+            self.btn_stop.config(state=tk.NORMAL)
         except FileNotFoundError as e:
-            err_msg = str(e)
-            self.after(0, lambda msg=err_msg: self._on_start_error("tshark not found", msg))
+            messagebox.showerror("tshark not found", str(e))
         except Exception as e:
-            err_msg = str(e)
-            self.after(0, lambda msg=err_msg: self._on_start_error("Error starting capture", msg))
-
-    def _on_start_success(self, proc, pcap_path):
-        self.proc = proc
-        self.pcap_path = pcap_path
-        self.status_var.set("Capturing…")
-        self.btn_stop.config(state=tk.NORMAL)
-
-    def _on_start_error(self, title, message):
-        messagebox.showerror(title, message)
-        self.btn_start.config(state=tk.NORMAL)
-        self.status_var.set("Ready")
+            messagebox.showerror("Error starting capture", str(e))
 
     def on_stop(self):
         if self.proc is None:
             return
-        # Disable button immediately and save state
-        self.btn_stop.config(state=tk.DISABLED)
-        self.status_var.set("Stopping capture…")
-        proc = self.proc
-        pcap_path = self.pcap_path
-        self.proc = None  # Clear immediately to prevent double-stop
-        # Run stop in background to avoid blocking UI
-        threading.Thread(target=self._stop_capture_thread, args=(proc, pcap_path), daemon=True).start()
-
-    def _stop_capture_thread(self, proc, pcap_path):
         try:
-            stop_capture(proc)
-            # Update UI on main thread
-            self.after(0, lambda path=pcap_path: self._on_stop_success(path))
+            stop_capture(self.proc)
+            self.status_var.set(f"Stopped — saved to {self.pcap_path}")
         except Exception as e:
-            err_msg = str(e)
-            self.after(0, lambda msg=err_msg: self._on_stop_error(msg))
+            messagebox.showerror("Error stopping capture", str(e))
+        finally:
+            self.btn_start.config(state=tk.NORMAL)
+            self.btn_stop.config(state=tk.DISABLED)
+            self.proc = None
+            # keep self.pcap_path for the saved location display
 
-    def _on_stop_success(self, pcap_path):
-        self.status_var.set(f"Stopped — saved to {pcap_path}")
-        self.btn_start.config(state=tk.NORMAL)
         # Process the pcap and run a prediction in background
-        if pcap_path:
-            threading.Thread(target=self._process_and_predict, args=(pcap_path,), daemon=True).start()
-
-    def _on_stop_error(self, message):
-        messagebox.showerror("Error stopping capture", message)
-        self.btn_start.config(state=tk.NORMAL)
-        self.status_var.set("Error stopping capture")
+        if self.pcap_path:
+            threading.Thread(target=self._process_and_predict, args=(self.pcap_path,), daemon=True).start()
 
     def _process_and_predict(self, pcap_path: str):
         try:
@@ -253,7 +218,7 @@ class CaptureApp(tk.Tk):
                 accepted = True  # No probabilities available, accept by default
             elif self.monitored_labels is not None and label not in self.monitored_labels:
                 accepted = False
-                reject_reason = f"'{label}' not in monitored sites"
+                reject_reason = "not in monitored sites"
             elif proba < self.confidence_threshold:
                 accepted = False
                 reject_reason = f"low confidence ({proba:.1%} < {self.confidence_threshold:.0%})"
@@ -272,8 +237,7 @@ class CaptureApp(tk.Tk):
             self.after(0, lambda: self.status_var.set(msg))
 
         except Exception as e:
-            err_msg = str(e)
-            self.after(0, lambda msg=err_msg: messagebox.showerror("Prediction error", msg))
+            self.after(0, lambda: messagebox.showerror("Prediction error", str(e)))
 
     def _build_feature_analysis(self, label: str, proba: float | None, margin: float | None, importance_df: pd.DataFrame) -> str:
         """Build detailed feature analysis text showing what drove the classification."""
@@ -369,6 +333,6 @@ class CaptureApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    # Use MacBook Wi‑Fi interface by default; change to en1 on Mac Studio.
-    app = CaptureApp(interface="en0")
+    app = CaptureApp(interface="en1")
     app.mainloop()
+1

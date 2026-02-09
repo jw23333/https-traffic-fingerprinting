@@ -39,32 +39,31 @@ PROJECT_DIR = Path(DEFAULT_OUT_DIR)
 DATASET_DIR = PROJECT_DIR / "dataset_raw"
 
 # Sites to visit. Use full URL strings.
-# Chosen for diverse, relatively stable traffic patterns.
-# MONITORED sites (will be used for actual monitoring):
-#   - wikipedia.org (lightweight)
-#   - npmjs.com (medium, package index)
-# DECOY sites (trained to distinguish from monitored sites, not used for monitoring):
-#   - apple.com (medium, product site)
-#   - youtube.com (heavy, video platform)
-#   - reuters.com (medium, news)
+# MONITORED sites (used for actual monitoring):
+#   - chickenpox (short, rash-based illness)
+#   - measles (short/medium, rash-based illness)
+# DECOY sites (structurally similar, same domain):
+#   - mumps (vaccine-preventable, similar symptom layout)
+#   - rubella (rash illness, similar section flow)
+#   - shingles (rash illness, similar assets)
 SITES: List[str] = [
-    "https://www.wikipedia.org",      # MONITORED: lightweight
-    "https://www.npmjs.com",          # MONITORED: medium (packages)
-    "https://www.github.com",         # DECOY: medium (code repo)
-    "https://www.youtube.com",        # DECOY: heavy (video)
-    "https://news.ycombinator.com",   # DECOY: lightweight+ (news)
+    "https://www.nhs.uk/conditions/chickenpox/",
+    "https://www.nhs.uk/conditions/measles/",
+    "https://www.nhs.uk/conditions/mumps/",
+    "https://www.nhs.uk/conditions/rubella/",
 ]
 
 # Different visit counts for monitored vs decoy sites
-VISITS_MONITORED = 70      # 70 visits for wikipedia and npmjs (more data = better learning)
-VISITS_DECOY = 30          # 30 visits for decoys (enough to distinguish, less collection time)
+VISITS_MONITORED = 70
+VISITS_DECOY = 70
 
 # Determine visits per site based on whether it's monitored
-MONITORED_SITES = {"https://www.wikipedia.org", "https://www.npmjs.com"}
+MONITORED_SITES = {"chickenpox", "measles"}
 
 def get_visits_for_site(site_url: str) -> int:
     """Return number of visits for this site (70 for monitored, 30 for decoys)."""
-    return VISITS_MONITORED if site_url in MONITORED_SITES else VISITS_DECOY
+    site_name = sanitize_name(site_url)
+    return VISITS_MONITORED if site_name in MONITORED_SITES else VISITS_DECOY
 CAPTURE_SECONDS = 2.5
 # Seconds to wait after opening the site before starting capture (if start_before_visit=False)
 DELAY_BEFORE_CAPTURE = 0.3
@@ -75,13 +74,26 @@ START_BEFORE_VISIT = True
 
 
 def sanitize_name(url: str) -> str:
-    """Make a filesystem-friendly name for a site (used for subfolder/prefix)."""
-    # remove scheme
+    """Make a filesystem-friendly name for a site (used for subfolder/prefix).
+    
+    For NHS URLs like https://www.nhs.uk/conditions/depression/, extracts 'depression'.
+    For other URLs, falls back to domain name.
+    """
     name = url.lower()
+    # remove scheme
     for prefix in ("http://", "https://", "www."):
         if name.startswith(prefix):
             name = name[len(prefix):]
-    # replace path and non-alnum with underscore
+    
+    # Try to extract condition name from /conditions/<name>/ path
+    if "/conditions/" in name:
+        parts = name.split("/conditions/")
+        if len(parts) > 1:
+            condition = parts[1].rstrip("/")
+            if condition:
+                return condition
+    
+    # Fallback: use domain name
     name = name.split("/", 1)[0]
     safe = ''.join([c if c.isalnum() else '_' for c in name])
     return safe
@@ -174,7 +186,10 @@ def run_collection(sites: List[str] = SITES):
         site_dir.mkdir(parents=True, exist_ok=True)
 
         visits_for_this_site = get_visits_for_site(site)
-        site_type = "MONITORED" if site in MONITORED_SITES else "DECOY"
+        if not MONITORED_SITES:
+            site_type = "PILOT"
+        else:
+            site_type = "MONITORED" if site_name in MONITORED_SITES else "DECOY"
         
         print(f"\n=== Collecting for site: {site} ({site_dir}) [{site_type}] ===")
         print(f"    Will collect {visits_for_this_site} visits")
