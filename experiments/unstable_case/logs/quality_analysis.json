@@ -1,0 +1,69 @@
+{
+  "variance_analysis": {
+    "amazon": {
+      "min_pairs": 254,
+      "max_pairs": 762,
+      "mean_pairs": 448.52,
+      "variance_ratio": 3.0,
+      "coefficient_of_variation": 23.094670251868056,
+      "quality": "GOOD"
+    },
+    "apple": {
+      "min_pairs": 42,
+      "max_pairs": 559,
+      "mean_pairs": 288.725,
+      "variance_ratio": 13.30952380952381,
+      "coefficient_of_variation": 38.32425421832727,
+      "quality": "HIGH"
+    },
+    "microsoft": {
+      "min_pairs": 202,
+      "max_pairs": 729,
+      "mean_pairs": 428.52,
+      "variance_ratio": 3.608910891089109,
+      "coefficient_of_variation": 26.73364658410274,
+      "quality": "GOOD"
+    },
+    "nytimes": {
+      "min_pairs": 193,
+      "max_pairs": 987,
+      "mean_pairs": 632.84,
+      "variance_ratio": 5.1139896373057,
+      "coefficient_of_variation": 25.40192159878309,
+      "quality": "OK"
+    }
+  },
+  "feature_stability": {
+    "amazon": {
+      "n_samples": 50,
+      "avg_feature_cv": 55.43124223724135
+    },
+    "apple": {
+      "n_samples": 40,
+      "avg_feature_cv": 64.3813392319589
+    },
+    "microsoft": {
+      "n_samples": 50,
+      "avg_feature_cv": 63.451267064615536
+    },
+    "nytimes": {
+      "n_samples": 50,
+      "avg_feature_cv": 42.45236100095706
+    }
+  },
+  "inter_site_overlap": {
+    "amazon vs apple": 0.6039933680064399,
+    "amazon vs microsoft": 0.9039430598160473,
+    "amazon vs nytimes": 0.4891526765484504,
+    "apple vs microsoft": 0.6892072016930524,
+    "apple vs nytimes": 0.5601070982809684,
+    "microsoft vs nytimes": 0.5130422946953149
+  },
+  "conclusions": [
+    "Unstable websites have high variance in traffic patterns across visits",
+    "Feature-level metrics show high coefficient of variation (>50% typical)",
+    "Inter-site feature overlap makes model confusion likely",
+    "Despite high training accuracy, real-time performance suffers due to noisy feature distributions",
+    "This demonstrates why data quality (stability) is prerequisite for generalization"
+  ]
+}

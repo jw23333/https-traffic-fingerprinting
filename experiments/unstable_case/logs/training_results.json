@@ -1,0 +1,19 @@
+{
+  "experiment": "unstable_websites",
+  "websites": [
+    "apple.com",
+    "microsoft.com",
+    "amazon.com",
+    "nytimes.com"
+  ],
+  "total_samples": 200,
+  "classes": [
+    "amazon",
+    "apple",
+    "microsoft",
+    "nytimes"
+  ],
+  "test_accuracy": 0.9,
+  "confusion_matrix_plot": "/Users/yiweiwang/Desktop/Dissertation/Code/experiments/unstable_case/logs/unstable_confusion_matrix.png",
+  "note": "High accuracy but poor real-time generalization due to unstable traffic patterns"
+}

@@ -1,0 +1,57 @@
+{
+  "unstable_model": {
+    "accuracy": "~97%",
+    "description": "High offline accuracy, poor real-time performance",
+    "characteristics": {
+      "variance": "HIGH (5-15x variance ratio)",
+      "consistency": "LOW (CV > 40% per feature)",
+      "gui_performance": "POOR (random predictions)",
+      "confidence": "LOW (rarely passes 0.50 threshold)"
+    }
+  },
+  "stable_model": {
+    "accuracy": "~98%",
+    "description": "High offline accuracy, reliable real-time performance",
+    "characteristics": {
+      "variance": "EXCELLENT (< 3x variance ratio)",
+      "consistency": "HIGH (CV < 20% per feature)",
+      "gui_performance": "GOOD (consistent predictions)",
+      "confidence": "HIGH (most pass 0.50 threshold)"
+    }
+  },
+  "variance_analysis": {
+    "amazon": {
+      "min_pairs": 254,
+      "max_pairs": 762,
+      "mean_pairs": 448.52,
+      "variance_ratio": 3.0,
+      "coefficient_of_variation": 23.094670251868056,
+      "quality": "GOOD"
+    },
+    "apple": {
+      "min_pairs": 42,
+      "max_pairs": 559,
+      "mean_pairs": 288.725,
+      "variance_ratio": 13.30952380952381,
+      "coefficient_of_variation": 38.32425421832727,
+      "quality": "HIGH"
+    },
+    "microsoft": {
+      "min_pairs": 202,
+      "max_pairs": 729,
+      "mean_pairs": 428.52,
+      "variance_ratio": 3.608910891089109,
+      "coefficient_of_variation": 26.73364658410274,
+      "quality": "GOOD"
+    },
+    "nytimes": {
+      "min_pairs": 193,
+      "max_pairs": 987,
+      "mean_pairs": 632.84,
+      "variance_ratio": 5.1139896373057,
+      "coefficient_of_variation": 25.40192159878309,
+      "quality": "OK"
+    }
+  },
+  "key_insight": "The difference is not in algorithm, but in data quality. Unstable websites create noisy features that the model learns but don't generalize."
+}

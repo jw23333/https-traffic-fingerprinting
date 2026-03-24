@@ -51,6 +51,12 @@ except Exception:
     print("Missing dependency: joblib. Install with: pip install joblib")
     raise
 
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    print("Missing dependency: matplotlib. Install with: pip install matplotlib")
+    raise
+
 
 def read_pairs_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -266,6 +272,42 @@ def build_dataset_from_metadata(meta_csv: Path, feature_mode: str = 'summary', k
     return X, pd.Series(labels), file_paths
 
 
+def plot_confusion_matrix_figure(cm: np.ndarray, class_names: list[str], out_path: Path):
+    """Save a visual confusion matrix figure for dissertation/report use."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+
+    ax.set_title('Confusion Matrix', fontsize=14, pad=12)
+    ax.set_xlabel('Predicted Label', fontsize=11)
+    ax.set_ylabel('True Label', fontsize=11)
+
+    ax.set_xticks(np.arange(len(class_names)))
+    ax.set_yticks(np.arange(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=45, ha='right')
+    ax.set_yticklabels(class_names)
+
+    # Add counts inside each cell for readability.
+    threshold = cm.max() / 2.0 if cm.size else 0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j,
+                i,
+                f"{cm[i, j]}",
+                ha='center',
+                va='center',
+                color='white' if cm[i, j] > threshold else 'black',
+                fontsize=11,
+                fontweight='bold',
+            )
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
 def train_and_evaluate(X: pd.DataFrame, y: pd.Series, test_size: float, out_model: Path, random_state: int = 42):
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
@@ -280,7 +322,12 @@ def train_and_evaluate(X: pd.DataFrame, y: pd.Series, test_size: float, out_mode
     y_pred = clf.predict(X_test)
     print(classification_report(y_test, y_pred, target_names=le.classes_))
     print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    cm = confusion_matrix(y_test, y_pred)
+    print(cm)
+
+    cm_plot_path = Path(out_model).with_name(Path(out_model).stem + "_confusion_matrix.png")
+    plot_confusion_matrix_figure(cm, list(le.classes_), cm_plot_path)
+    print(f"Saved confusion matrix plot to: {cm_plot_path}")
 
     # Save model + encoder + feature names
     out_model = Path(out_model)

@@ -13,6 +13,8 @@ You can extend this later with a timer, live packet counter, or a folder picker.
 """
 
 import os
+import sys
+import argparse
 import threading
 import tkinter as tk
 from tkinter import messagebox, scrolledtext
@@ -28,7 +30,7 @@ from process_dataset_pairs import read_pairs_csv, summary_features
 
 
 class CaptureApp(tk.Tk):
-    def __init__(self, interface: str = "en1", out_dir: str | None = None):
+    def __init__(self, interface: str = "en1", out_dir: str | None = None, model_path: str | None = None, accept_all_labels: bool = False, accept_labels: list[str] | None = None):
         super().__init__()
         self.title("HTTPS Capture")
         self.resizable(True, True)
@@ -41,10 +43,13 @@ class CaptureApp(tk.Tk):
         self.pcap_path = None
 
         # Model bundle path candidates (adjust if needed)
-        self.model_candidates = [
-            os.path.join(os.getcwd(), "models", "rf_model.joblib"),
-            os.path.join(os.getcwd(), "rf_model.joblib"),
-        ]
+        if model_path:
+            self.model_candidates = [model_path]
+        else:
+            self.model_candidates = [
+                os.path.join(os.getcwd(), "models", "rf_model.joblib"),
+                os.path.join(os.getcwd(), "rf_model.joblib"),
+            ]
 
         # Cleanup toggle: remove pcap/pairs/csv after prediction
         self.cleanup_after_predict = True
@@ -58,7 +63,14 @@ class CaptureApp(tk.Tk):
         
         # Optional: only accept predictions for these specific labels (None = all trained labels)
         # Example: {"chickenpox", "measles"} to ignore decoy sites
-        self.monitored_labels: set[str] | None = {"chickenpox", "measles"}
+        # If accept_all_labels=True, accept any label from the model
+        # If accept_labels is provided, use those labels
+        if accept_labels:
+            self.monitored_labels = set(accept_labels)
+        elif accept_all_labels:
+            self.monitored_labels = None
+        else:
+            self.monitored_labels: set[str] | None = {"chickenpox", "measles"}
 
         # Technical details toggle state
         self.show_technical = False
@@ -434,6 +446,13 @@ class CaptureApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = CaptureApp(interface="en0") #en0 for macbook and en1 for mac studio
+    parser = argparse.ArgumentParser(description="HTTPS Traffic Capture GUI")
+    parser.add_argument("--interface", default="en1", help="Network interface (default: en0)")
+    parser.add_argument("--model", help="Path to model bundle (.joblib file)")
+    parser.add_argument("--accept-all-labels", action="store_true", help="Accept any labels from model (for testing unstable models)")
+    parser.add_argument("--accept-labels", nargs="+", help="Accept only these specific labels (space-separated, e.g., --accept-labels apple amazon)")
+    args = parser.parse_args()
+    
+    app = CaptureApp(interface=args.interface, model_path=args.model, accept_all_labels=args.accept_all_labels, accept_labels=args.accept_labels)
     app.mainloop()
 1

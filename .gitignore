@@ -5,10 +5,14 @@ __pycache__/
 dataset_raw/
 dataset_pairs/
 pairs_metadata.csv
-models/rf_model.joblib
+models/
+*.joblib
 *.pcap
 .idea/
 .vscode/
 *.egg-info/
 dist/
 build/
+experiments/unstable_case/raw/
+experiments/unstable_case/pairs/
+experiments/unstable_case/models/
