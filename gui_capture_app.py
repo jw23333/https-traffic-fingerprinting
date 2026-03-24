@@ -79,7 +79,7 @@ class CaptureApp(tk.Tk):
         # Toggle button for technical details
         self.btn_toggle_technical = tk.Button(
             self, 
-            text="Show technical details ▼", 
+            text="Show technical details ▲", 
             command=self.toggle_technical_details,
             state=tk.DISABLED
         )
@@ -366,7 +366,7 @@ class CaptureApp(tk.Tk):
         
         # Update button state
         if importance_df is not None and not importance_df.empty:
-            self.btn_toggle_technical.config(state=tk.NORMAL, text="Show technical details ▼")
+            self.btn_toggle_technical.config(state=tk.NORMAL, text="Show technical details ▲")
         else:
             self.btn_toggle_technical.config(state=tk.DISABLED)
         
@@ -404,11 +404,11 @@ class CaptureApp(tk.Tk):
                     f"{feat_name:30s}  importance: {importance:6.4f}  value: {original_value:12.2f}\n"
                 )
             
-            self.btn_toggle_technical.config(text="Hide technical details ▲")
+            self.btn_toggle_technical.config(text="Hide technical details ▼")
         else:
             # Show simple text only
             self.feature_text.insert("1.0", self.current_simple_text)
-            self.btn_toggle_technical.config(text="Show technical details ▼")
+            self.btn_toggle_technical.config(text="Show technical details ▲")
         
         self.feature_text.config(state=tk.DISABLED)
 
@@ -434,6 +434,6 @@ class CaptureApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = CaptureApp(interface="en1")
+    app = CaptureApp(interface="en0") #en0 for macbook and en1 for mac studio
     app.mainloop()
 1
