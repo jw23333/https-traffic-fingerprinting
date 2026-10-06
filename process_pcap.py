@@ -18,10 +18,24 @@ import argparse       # parse command-line arguments
 import csv            # write the output CSV file
 import os             # file paths
 import subprocess     # run tshark and ipconfig commands
+from dataclasses import dataclass
 from pathlib import Path
 
 # The same BPF filter we used for capture: HTTPS (TLS/QUIC)
 HTTPS_BPF_FILTER = "tcp.port==443 || udp.port==443"
+
+
+@dataclass
+class CaptureData:
+    """One capture and its derived views, retained for interactive inspection.
+
+    A burst's packet_indices refer to the time-sorted packets in this object.
+    Packet dictionaries retain tshark's original frame numbers and metadata.
+    """
+
+    packets: list
+    bursts: list
+    pairs: list
 
 
 def get_local_ips(iface: str) -> set[str]:
@@ -97,6 +111,7 @@ def run_tshark_fields(pcap_path: str) -> list:
         "-r", pcap_path,
         "-Y", HTTPS_BPF_FILTER,
         "-T", "fields",
+        "-e", "frame.number",
         "-e", "frame.time_relative",
         "-e", "ip.src",
         "-e", "ip.dst",
@@ -205,7 +220,7 @@ def compute_bursts(labeled_rows: list, gap_seconds: float = 0.05) -> list:
         if current and current['count'] > 0:
             bursts.append(current.copy())
 
-    for r in rows:
+    for packet_index, r in enumerate(rows):
         t = float(r['frame.time_relative']) if r.get('frame.time_relative') else 0.0
         direction = r.get('direction', 'out')
         size = abs(int(r.get('signed_len', '0') or 0))
@@ -219,6 +234,7 @@ def compute_bursts(labeled_rows: list, gap_seconds: float = 0.05) -> list:
                 'start': t, 'end': t, 'dir': direction,
                 'count': 1, 'bytes': size,
                 'stream': stream, 'proto': proto,
+                'packet_indices': [packet_index],
             }
             continue
 
@@ -229,16 +245,37 @@ def compute_bursts(labeled_rows: list, gap_seconds: float = 0.05) -> list:
             current['end'] = t
             current['count'] += 1
             current['bytes'] += size
+            current['packet_indices'].append(packet_index)
         else:
             flush()
             current = {
                 'start': t, 'end': t, 'dir': direction,
                 'count': 1, 'bytes': size,
                 'stream': stream, 'proto': proto,
+                'packet_indices': [packet_index],
             }
 
     flush()
     return bursts
+
+
+def build_capture_data(rows: list, local_ips: set[str], gap_ms: float = 50.0) -> CaptureData:
+    """Derive inspection and model inputs using the existing burst/pair rules."""
+    packets = sorted(
+        add_direction_and_signed_len(rows, local_ips),
+        key=lambda row: float(row['frame.time_relative']),
+    )
+    bursts = compute_bursts(packets, gap_seconds=gap_ms / 1000.0)
+    return CaptureData(packets, bursts, bursts_to_pairs(bursts))
+
+
+def load_capture_data(pcap_path: str, iface: str, gap_ms: float = 50.0,
+                      local_ips: set[str] | None = None) -> CaptureData:
+    """Read a pcap once; a live caller can supply IPs recorded at capture start."""
+    ips = get_local_ips(iface) if local_ips is None else local_ips
+    if not ips:
+        raise ValueError("At least one client IP is required to label packet direction.")
+    return build_capture_data(run_tshark_fields(pcap_path), ips, gap_ms)
 
 
 def bursts_to_pairs(bursts: list) -> list:

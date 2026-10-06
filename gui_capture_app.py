@@ -1,458 +1,347 @@
 #!/usr/bin/env python3
+"""Capture HTTPS traffic, inspect bursts/packets, and display the RF prediction.
+
+Run: python3 gui_capture_app.py --interface en1
+Saved capture: python3 gui_capture_app.py --pcap capture.pcap --local-ip 192.168.1.10
 """
-A minimal Tkinter GUI for starting and stopping HTTPS captures using tshark.
+from __future__ import annotations
 
-- Start: begins a background capture (manual stop)
-- Stop:  stops the capture cleanly; shows where the .pcap was saved
-
-Defaults for this demo:
-- interface: "en1"
-- out_dir:   Project directory (same folder as these scripts)
-
-You can extend this later with a timer, live packet counter, or a folder picker.
-"""
-
-import os
-import sys
 import argparse
+import ipaddress
+import os
+from pathlib import Path
+import queue
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
-from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
 
 from capture_safari_all import start_capture, stop_capture, DEFAULT_OUT_DIR
-from process_pcap import process_pcap
-from process_dataset_pairs import read_pairs_csv, summary_features
+from process_pcap import (CaptureData, default_pairs_csv_path, get_local_ips,
+                          load_capture_data, write_pairs_csv)
+from process_dataset_pairs import summary_features
+from traffic_inspector import TrafficInspector
+
+
+def parse_client_ips(value: str) -> set[str]:
+    """Validate comma/space-separated IPv4 or IPv6 client addresses."""
+    ips = {str(ipaddress.ip_address(part.split('%', 1)[0]))
+           for part in value.replace(',', ' ').split()}
+    if not ips:
+        raise ValueError('Enter at least one client IP address from the saved capture.')
+    return ips
+
+
+def predict_capture(capture: CaptureData, model_candidates: list[str],
+                    confidence_threshold: float, margin_threshold: float,
+                    monitored_labels: set[str] | None) -> dict:
+    """Use the existing summary features, preprocessing and trained model."""
+    if not capture.pairs:
+        return {'available': False, 'reason': 'No outgoing/incoming burst pairs to classify.'}
+    bundle_path = next((path for path in model_candidates if Path(path).is_file()), None)
+    if bundle_path is None:
+        raise FileNotFoundError('Trained model not found. Supply --model or place rf_model.joblib in the project directory.')
+    bundle = joblib.load(bundle_path)
+    clf = bundle.get('model')
+    encoder = bundle.get('label_encoder')
+    names = bundle.get('feature_names')
+    if clf is None or encoder is None or names is None:
+        raise ValueError('Model bundle must contain model, label_encoder and feature_names.')
+    features = summary_features(pd.DataFrame(capture.pairs))
+    raw = pd.DataFrame([features]).replace([np.inf, -np.inf], 0).fillna(0)
+    missing = set(names) - set(raw.columns)
+    if missing:
+        raise ValueError('This inspector requires a summary-feature model. Missing features: ' + ', '.join(sorted(missing)[:5]))
+    X = np.log1p(raw).reindex(columns=names)
+    encoded_label = clf.predict(X)[0]
+    label = str(encoder.inverse_transform([encoded_label])[0])
+    confidence = margin = None
+    if hasattr(clf, 'predict_proba'):
+        probabilities = clf.predict_proba(X)[0]
+        # Use the probability of the predicted class, regardless of class order.
+        position = list(clf.classes_).index(encoded_label)
+        confidence = float(probabilities[position])
+        competitors = np.delete(probabilities, position)
+        margin = confidence - float(competitors.max()) if len(competitors) else confidence
+    reason = None
+    if monitored_labels is not None and label not in monitored_labels:
+        reason = 'Predicted page is outside the monitored set.'
+    elif confidence is not None and confidence < confidence_threshold:
+        reason = f'Confidence is below {confidence_threshold:.0%}.'
+    elif margin is not None and margin < margin_threshold:
+        reason = f'Top-two probability gap is below {margin_threshold:.0%}.'
+    return {
+        'available': True, 'label': label, 'confidence': confidence, 'margin': margin,
+        'accepted': reason is None, 'reason': reason,
+        'features': [(name, float(raw.iloc[0][name]), float(importance))
+                     for name, importance in zip(names, clf.feature_importances_)],
+    }
 
 
 class CaptureApp(tk.Tk):
-    def __init__(self, interface: str = "en1", out_dir: str | None = None, model_path: str | None = None, accept_all_labels: bool = False, accept_labels: list[str] | None = None):
+    def __init__(self, interface: str = 'en1', out_dir: str | None = None,
+                 model_path: str | None = None, accept_all_labels: bool = False,
+                 accept_labels: list[str] | None = None):
         super().__init__()
-        self.title("HTTPS Capture")
-        self.resizable(True, True)
-
-        # Defaults and state
+        self.title('HTTPS Traffic Inspector')
+        self.geometry('1240x900')
+        self.minsize(980, 760)
         self.interface = interface
-        # Default to the project directory if not provided
         self.out_dir = os.path.expanduser(out_dir) if out_dir else DEFAULT_OUT_DIR
         self.proc = None
         self.pcap_path = None
-
-        # Model bundle path candidates (adjust if needed)
-        if model_path:
-            self.model_candidates = [model_path]
-        else:
-            self.model_candidates = [
-                os.path.join(os.getcwd(), "models", "rf_model.joblib"),
-                os.path.join(os.getcwd(), "rf_model.joblib"),
-            ]
-
-        # Cleanup toggle: remove pcap/pairs/csv after prediction
+        self.capture_data = None
+        self.capture_local_ips = None
+        self.processing = False
+        self.closing = False
+        self.events = queue.Queue()
         self.cleanup_after_predict = True
-
-        # Confidence cutoff for monitored-site detection (abstain below this)
-        self.confidence_threshold = 0.5
-        
-        # Margin threshold: reject if top-1 and top-2 probabilities are too close
-        # Helps prevent false positives when model is unsure between similar sites
+        # Preserve the existing project's current decision thresholds.
+        self.confidence_threshold = 0.70
         self.margin_threshold = 0.20
-        
-        # Optional: only accept predictions for these specific labels (None = all trained labels)
-        # Example: {"chickenpox", "measles"} to ignore decoy sites
-        # If accept_all_labels=True, accept any label from the model
-        # If accept_labels is provided, use those labels
-        if accept_labels:
-            self.monitored_labels = set(accept_labels)
-        elif accept_all_labels:
-            self.monitored_labels = None
-        else:
-            self.monitored_labels: set[str] | None = {"chickenpox", "measles"}
+        self.monitored_labels = (set(accept_labels) if accept_labels else
+                                 None if accept_all_labels else {'chickenpox', 'measles'})
+        self.model_candidates = ([os.path.expanduser(model_path)] if model_path else [
+            str(Path.cwd() / 'models' / 'rf_model.joblib'),
+            str(Path.cwd() / 'rf_model.joblib'),
+            str(Path(__file__).parent / 'rf_model.joblib'),
+        ])
+        self._build_ui()
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
+        self.after(100, self._poll_events)
 
-        # Technical details toggle state
-        self.show_technical = False
-        self.current_technical_data = None  # Store importance_df for toggle
-        self.current_simple_text = ""  # Store simple explanation text
+    def _build_ui(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)
+        controls = ttk.Frame(self, padding=(12, 10))
+        controls.grid(row=0, column=0, sticky='ew')
+        self.btn_start = ttk.Button(controls, text='Start capture', command=self.on_start)
+        self.btn_start.pack(side='left')
+        self.btn_stop = ttk.Button(controls, text='Stop capture', command=self.on_stop, state='disabled')
+        self.btn_stop.pack(side='left', padx=8)
+        self.btn_open = ttk.Button(controls, text='Open capture…', command=self.on_open)
+        self.btn_open.pack(side='left')
+        ttk.Label(controls, text=f'Interface: {self.interface} · TCP/UDP port 443').pack(side='right')
 
-        # UI elements
-        self.status_var = tk.StringVar(value="Ready")
-        self.status_label = tk.Label(self, textvariable=self.status_var, width=50, anchor="w")
-        self.btn_start = tk.Button(self, text="Start", width=12, command=self.on_start)
-        self.btn_stop = tk.Button(self, text="Stop", width=12, command=self.on_stop, state=tk.DISABLED)
-        
-        # Feature analysis display
-        self.feature_text = scrolledtext.ScrolledText(self, width=80, height=20, wrap=tk.WORD, font=("Monaco", 10))
-        self.feature_text.insert("1.0", "Capture traffic to see feature analysis...\n")
-        self.feature_text.config(state=tk.DISABLED)
-        
-        # Toggle button for technical details
-        self.btn_toggle_technical = tk.Button(
-            self, 
-            text="Show technical details ▲", 
-            command=self.toggle_technical_details,
-            state=tk.DISABLED
-        )
+        prediction = ttk.LabelFrame(self, text='Current prediction', padding=(12, 8))
+        prediction.grid(row=1, column=0, sticky='ew', padx=12)
+        self.prediction_var = tk.StringVar(value='No capture analysed yet')
+        self.prediction_detail_var = tk.StringVar(value='Stop a capture to inspect traffic and run the model.')
+        ttk.Label(prediction, textvariable=self.prediction_var, font=('Helvetica', 16, 'bold')).pack(anchor='w')
+        ttk.Label(prediction, textvariable=self.prediction_detail_var, wraplength=1100).pack(anchor='w', pady=(3, 0))
+        self.status_var = tk.StringVar(value='Ready')
+        ttk.Label(self, textvariable=self.status_var, wraplength=1100).grid(
+            row=2, column=0, sticky='w', padx=14, pady=6)
 
-        # Layout
-        self.status_label.grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 6), sticky="w")
-        self.btn_start.grid(row=1, column=0, padx=(10, 5), pady=(0, 10))
-        self.btn_stop.grid(row=1, column=1, padx=(5, 10), pady=(0, 10))
-        self.feature_text.grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 5), sticky="nsew")
-        self.btn_toggle_technical.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="ew")
-        
-        # Make feature text area expandable
-        self.grid_rowconfigure(2, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=3, column=0, sticky='nsew', padx=12, pady=(0, 12))
+        self.inspector = TrafficInspector(self.notebook)
+        self.notebook.add(self.inspector, text='Traffic inspection')
+        model_panel = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(model_panel, text='Model details')
+        model_panel.columnconfigure(0, weight=1)
+        model_panel.rowconfigure(2, weight=1)
+        ttk.Label(model_panel, text='Random Forest features', font=('Helvetica', 14, 'bold')).grid(row=0, column=0, sticky='w')
+        ttk.Label(model_panel, text='Values describe this capture. Importance is the model’s overall feature ranking; '
+                  'it does not explain this individual prediction.', wraplength=1000).grid(row=1, column=0, sticky='w', pady=8)
+        self.feature_table = ttk.Treeview(model_panel, columns=('feature', 'value', 'importance'), show='headings')
+        for column, label in [('feature', 'Feature'), ('value', 'Capture value'), ('importance', 'Global importance')]:
+            self.feature_table.heading(column, text=label)
+            self.feature_table.column(column, width=420 if column == 'feature' else 180, anchor='w')
+        self.feature_table.grid(row=2, column=0, sticky='nsew')
+        scrollbar = ttk.Scrollbar(model_panel, command=self.feature_table.yview)
+        scrollbar.grid(row=2, column=1, sticky='ns')
+        self.feature_table.configure(yscrollcommand=scrollbar.set)
 
-        # Placeholder for future periodic updates (timer, counters, etc.)
-        # self.after(1000, self._tick)
+    def _reset_result(self, message: str):
+        self.capture_data = None
+        self.inspector.clear()
+        self.feature_table.delete(*self.feature_table.get_children())
+        self.prediction_var.set(message)
+        self.prediction_detail_var.set('')
+        self.notebook.select(self.inspector)
+
+    def _set_busy(self, busy: bool):
+        self.processing = busy
+        self.btn_start.configure(state='disabled' if busy else 'normal')
+        self.btn_open.configure(state='disabled' if busy else 'normal')
+        self.btn_stop.configure(state='disabled')
 
     def on_start(self):
-        if self.proc is not None and self.proc.poll() is None:
-            print("Capture process already started")
+        if self.processing or self.proc is not None:
             return
         try:
+            # Record direction-label information before capture starts.
+            ips = get_local_ips(self.interface)
             self.proc, self.pcap_path = start_capture(
-                interface=self.interface,
-                out_dir=self.out_dir,
-                prefix="safari",
-                duration=None,
-                fixed=False,
-            )
-            self.status_var.set("Capturing…")
-            self.btn_start.config(state=tk.DISABLED)
-            self.btn_stop.config(state=tk.NORMAL)
-        except FileNotFoundError as e:
-            messagebox.showerror("tshark not found", str(e))
-        except Exception as e:
-            messagebox.showerror("Error starting capture", str(e))
+                interface=self.interface, out_dir=self.out_dir,
+                prefix='safari', duration=None, fixed=False)
+            self.capture_local_ips = ips
+            self._reset_result('Capturing — prediction pending')
+            self.status_var.set('Capturing… Browse to a page, then stop to inspect the traffic.')
+            self.btn_start.configure(state='disabled')
+            self.btn_open.configure(state='disabled')
+            self.btn_stop.configure(state='normal')
+        except Exception as error:
+            messagebox.showerror('Capture error', str(error))
 
     def on_stop(self):
-        if self.proc is None:
+        if self.proc is None or self.processing:
+            return
+        self._set_busy(True)
+        self.prediction_var.set('Processing capture…')
+        self.status_var.set('Stopping capture and building packet/burst views…')
+        threading.Thread(target=self._process_and_predict,
+                         args=(self.pcap_path, self.capture_local_ips, True, self.proc), daemon=True).start()
+
+    def on_open(self):
+        if self.processing or self.proc is not None:
+            return
+        path = filedialog.askopenfilename(title='Open a saved capture',
+                                         filetypes=[('Packet captures', '*.pcap *.pcapng'), ('All files', '*')])
+        if not path:
+            return
+        value = simpledialog.askstring('Client IP in saved capture',
+            'Enter the computer’s IP address(es) at the time of this capture.\n'
+            'Separate multiple addresses with commas or spaces.\n'
+            'These determine incoming and outgoing direction.', parent=self)
+        if value is None:
             return
         try:
-            stop_capture(self.proc)
-            self.status_var.set(f"Stopped — saved to {self.pcap_path}")
-        except Exception as e:
-            messagebox.showerror("Error stopping capture", str(e))
-        finally:
-            self.btn_start.config(state=tk.NORMAL)
-            self.btn_stop.config(state=tk.DISABLED)
-            self.proc = None
-            # keep self.pcap_path for the saved location display
+            ips = parse_client_ips(value)
+        except ValueError as error:
+            messagebox.showerror('Invalid client IP', str(error))
+            return
+        self.open_capture(path, ips)
 
-        # Process the pcap and run a prediction in background
-        if self.pcap_path:
-            threading.Thread(target=self._process_and_predict, args=(self.pcap_path,), daemon=True).start()
+    def open_capture(self, path: str, local_ips: set[str]):
+        if self.processing or self.proc is not None:
+            return
+        self.pcap_path = path
+        self._reset_result('Processing capture…')
+        self._set_busy(True)
+        self.status_var.set(f'Reading {Path(path).name}…')
+        threading.Thread(target=self._process_and_predict,
+                         args=(path, local_ips, False), daemon=True).start()
 
-    def _process_and_predict(self, pcap_path: str):
+    def _process_and_predict(self, pcap_path: str, local_ips: set[str],
+                             cleanup: bool = False, proc=None):
+        """Worker thread: communicate through a queue, never touch Tk widgets."""
         try:
-            # Update UI: processing started
-            self.after(0, lambda: self.status_var.set("Processing capture → features → prediction…"))
+            if proc is not None:
+                stop_capture(proc)
+            capture = load_capture_data(pcap_path, self.interface, local_ips=local_ips)
+        except Exception as error:
+            self.events.put(('error', str(error)))
+            return
+        prediction_error = None
+        prediction = None
+        cleanup_error = None
+        try:
+            # Preserve the existing live capture's pairs-file behaviour.
+            pairs_path = default_pairs_csv_path(pcap_path)
+            if cleanup:
+                write_pairs_csv(capture.pairs, pairs_path)
+            prediction = predict_capture(capture, self.model_candidates, self.confidence_threshold,
+                                         self.margin_threshold, self.monitored_labels)
+            if cleanup and self.cleanup_after_predict:
+                cleanup_error = self._cleanup_files(pcap_path, pairs_path)
+        except Exception as error:
+            prediction_error = str(error)
+        self.events.put(('result', (capture, prediction, prediction_error, Path(pcap_path).name, cleanup_error)))
 
-            # 1) Process pcap into burst pairs CSV (uses default pairs path next to pcap)
-            _, pairs_path = process_pcap(
-                pcap_path=pcap_path,
-                iface=self.interface,
-                packets_csv=None,
-                pairs_csv=None,
-                gap_ms=50.0,
-            )
-
-            # 2) Build a single-row feature DataFrame (summary mode)
-            df = read_pairs_csv(Path(pairs_path))
-            feats = summary_features(df)
-            X = pd.DataFrame([feats]).fillna(0)
-
-            # Match trainer preprocessing: replace inf/nan, then log1p on numeric cols
-            X = X.replace([np.inf, -np.inf], 0).fillna(0)
-            numeric_cols = X.select_dtypes(include=[np.number]).columns
-            X[numeric_cols] = np.log1p(X[numeric_cols])
-
-            # 3) Load model bundle
-            bundle_path = None
-            for cand in self.model_candidates:
-                if os.path.exists(cand):
-                    bundle_path = cand
-                    break
-            if not bundle_path:
-                raise FileNotFoundError(
-                    "Trained model not found. Expected models/rf_model.joblib or rf_model.joblib."
-                )
-
-            bundle = joblib.load(bundle_path)
-            clf = bundle.get('model')
-            le = bundle.get('label_encoder')
-            feature_names = bundle.get('feature_names')
-            if clf is None or le is None or feature_names is None:
-                raise RuntimeError("Model bundle missing keys: 'model', 'label_encoder', 'feature_names'.")
-
-            # 4) Align columns to training feature order
-            X = X.reindex(columns=feature_names, fill_value=0)
-
-            # 5) Predict and show result
-            y_pred = clf.predict(X)[0]
-            label = le.inverse_transform([y_pred])[0]
-            proba = None
-            proba_top2 = None
-            margin = None
-            try:
-                probas = clf.predict_proba(X)[0]
-                # Get top-1 and top-2 probabilities for margin check
-                sorted_probas = np.sort(probas)[::-1]
-                proba = float(sorted_probas[0])
-                proba_top2 = float(sorted_probas[1]) if len(sorted_probas) > 1 else 0.0
-                margin = proba - proba_top2
-            except Exception:
-                pass
-
-            # 6) Get feature importances from the model
-            feature_importances = clf.feature_importances_
-            
-            # Create importance ranking
-            importance_df = pd.DataFrame({
-                'feature': feature_names,
-                'importance': feature_importances,
-                'value': X.iloc[0].values
-            }).sort_values('importance', ascending=False)
-            
-            # Build detailed analysis text (includes accept/reject decision)
-            analysis = self._build_feature_analysis(label, proba, margin, importance_df)
-            self.after(0, lambda: self._display_analysis(analysis, importance_df))
-
-            # Optional cleanup of files after prediction
-            cleaned = False
-            if self.cleanup_after_predict:
-                try:
-                    self._cleanup_files(pcap_path, pairs_path)
-                    cleaned = True
-                    print(f"[Cleanup] Deleted: {pcap_path}, {pairs_path}")
-                except Exception as e:
-                    cleaned = False
-                    print(f"[Cleanup] Failed: {e}")
-
-            # Decide whether to accept or reject the prediction
-            # Check: confidence threshold, margin threshold, AND monitored label set
-            accepted = True
-            reject_reason = None
-            
-            if proba is None:
-                accepted = True  # No probabilities available, accept by default
-            elif self.monitored_labels is not None and label not in self.monitored_labels:
-                accepted = False
-                reject_reason = "not in monitored sites"
-            elif proba < self.confidence_threshold:
-                accepted = False
-                reject_reason = f"low confidence ({proba:.1%} < {self.confidence_threshold:.0%})"
-            elif margin is not None and margin < self.margin_threshold:
-                accepted = False
-                reject_reason = f"ambiguous ({proba:.1%} vs {proba_top2:.1%}, margin {margin:.1%} < {self.margin_threshold:.0%})"
-            
-            if accepted:
-                if proba is not None:
-                    base = f"Prediction: {label} (confidence {proba:.2f})"
+    def _poll_events(self):
+        if self.closing:
+            return
+        try:
+            while True:
+                event, payload = self.events.get_nowait()
+                self.proc = None
+                self._set_busy(False)
+                if event == 'error':
+                    self.prediction_var.set('Capture could not be processed')
+                    self.status_var.set(payload)
+                    messagebox.showerror('Processing error', payload)
                 else:
-                    base = f"Prediction: {label}"
-            else:
-                base = f"No monitored site detected ({reject_reason})"
-            msg = base + (" — cleaned up" if cleaned else f" — pairs: {pairs_path}")
-            self.after(0, lambda: self.status_var.set(msg))
+                    self._display_result(*payload)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_events)
 
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Prediction error", str(e)))
-
-    def _get_feature_explanation(self, feature_name: str) -> str:
-        """Map technical feature names to user-friendly explanations."""
-        explanations = {
-            # Bigrams (outbound transitions)
-            'bigram_out_S_to_S': 'the pattern where your browser sent two small requests in a row. Even though the content is encrypted, the timing and size of these paired requests creates a signature - some pages make lots of quick small requests, others don\'t',
-            'bigram_out_S_to_L': 'the pattern where a small request from your browser was immediately followed by sending a larger chunk of data. This sequence reveals how the page structures its communication - the rhythm of small-then-large is different for each website',
-            'bigram_out_L_to_S': 'the pattern where your browser sent a large amount of data followed by a smaller request. This "heavy then light" sequence happens in specific situations and varies distinctly between different pages',
-            'bigram_out_L_to_L': 'the pattern where your browser sent two large chunks of data consecutively. This sustained heavy communication pattern is quite rare and highly distinctive to specific types of web pages',
-            
-            # Bigrams (inbound transitions)
-            'bigram_in_S_to_S': 'the pattern where the website sent you two small responses back-to-back. Even encrypted, these small-small delivery patterns are like a fingerprint - each page has its own rhythm of delivering small chunks of information',
-            'bigram_in_S_to_L': 'the pattern where the website sent you a small response followed immediately by a large response. This acceleration from small to large reveals the page\'s content structure - perhaps a quick acknowledgment followed by heavy content',
-            'bigram_in_L_to_S': 'the pattern where the website sent you a large response followed by a smaller one. This "deliver big then small" rhythm indicates how the page stages its content, which varies significantly between different websites',
-            'bigram_in_L_to_L': 'the pattern where the website delivered two large responses consecutively. This sustained burst of heavy content is highly characteristic - different pages have very different patterns of when they send multiple large chunks',
-            
-            # Trigrams (outbound 3-burst patterns)
-            'trigram_out_S_S_S': 'a distinctive rhythm where your browser made three small requests in sequence. This triple-small pattern is like a dance move - each website orchestrates its requests differently, creating unique three-step signatures',
-            'trigram_out_S_S_L': 'a three-step pattern where your browser sent two small requests then ramped up to a large one. This escalating rhythm reveals the page\'s interaction flow and is surprisingly distinctive across different websites',
-            'trigram_out_S_L_S': 'a three-step pattern where your browser alternated small-large-small. This oscillating rhythm is unusual and highly identifying - it reveals a specific type of page interaction that not all websites use',
-            'trigram_out_S_L_L': 'a three-step pattern where your browser started small then sent two large chunks. This building momentum is characteristic of certain page types and their specific loading behavior',
-            'trigram_out_L_S_S': 'a three-step pattern starting with a large request then two small ones. This "start heavy, end light" sequence is distinctive and reveals how certain pages structure their initial communication',
-            'trigram_out_L_S_L': 'a three-step pattern alternating large-small-large. This back-and-forth rhythm is quite specific and appears in certain types of interactive pages, making it a strong identifier',
-            'trigram_out_L_L_S': 'a three-step pattern with two large requests followed by a small one. This "heavy heavy light" sequence suggests a specific loading strategy unique to certain page architectures',
-            'trigram_out_L_L_L': 'a three-step pattern of three large requests in a row. This sustained heavy communication is rare and extremely distinctive - very few page types create this intense request pattern',
-            
-            # Counts
-            'count_out_small': 'how many small requests your browser made in total. A medical page about chickenpox might make 15 small requests while a measles page makes 22 - these countable differences add up to create a unique signature',
-            'count_out_large': 'how many large data chunks your browser sent to the website. Different pages trigger different numbers of substantial requests based on their structure and functionality',
-            'count_in_small': 'how many small responses you received from the website. Each page delivers its content through a characteristic number of small chunks - some use many tiny pieces, others use fewer',
-            'count_in_large': 'how many large responses the website sent you. The number of substantial content deliveries varies dramatically - a text-heavy page might send 3 large chunks while an image-heavy one sends 20',
-            
-            # Ratios
-            'ratio_out_small': 'what fraction of all your requests were small ones. If 80% of your requests were small versus 20%, that balance is revealing - different pages have very different mixes of small versus large requests',
-            'ratio_out_large': 'what fraction of all your requests were large ones. This percentage reveals the communication style - some pages need mostly large uploads while others are dominated by small requests',
-            'ratio_in_small': 'what fraction of the website\'s responses were small chunks. A page that delivers 90% small responses behaves very differently from one that sends 30% small, and this ratio is highly characteristic',
-            'ratio_in_large': 'what fraction of the data you received came in large chunks. This reveals content delivery strategy - some sites send mostly big blocks (high ratio), others use incremental delivery (low ratio)',
-            'ratio_out_in_bytes': 'the ratio of data sent versus received. A typical article might be 1:50 (50 times more downloaded than uploaded), while an interactive form might be 1:2. This fundamental balance is highly distinctive across different pages',
-            
-            # Aggregates
-            'total_pairs': 'the total number of request-response exchanges. Loading the chickenpox page might involve 38 exchanges while measles takes 42 - even this simple count can be revealing when combined with other patterns',
-            'total_out_bytes': 'the total bytes your browser sent during the visit. Different pages require different amounts of outgoing data - one might need 15KB of requests while another needs 45KB, creating measurable differences',
-            'total_in_bytes': 'the total bytes downloaded from the website. Page sizes vary dramatically - a simple text page might be 200KB while a media-rich one is 2MB. Even encrypted, this total size is visible and distinctive',
-            'mean_out_bytes': 'the average size of each request your browser sent. If your average request was 350 bytes versus 890 bytes, this reveals different page architectures - some use many tiny requests, others use fewer large ones',
-            'mean_in_bytes': 'the average size of each response you received. A page that sends uniform 5KB chunks has a very different average than one mixing 1KB and 50KB responses, making this measurement quite revealing',
-            'std_out_bytes': 'how much the request sizes varied - measured by standard deviation. Consistent request sizes (low variation) versus wildly different sizes (high variation) reveals the page\'s communication consistency',
-            'std_in_bytes': 'how much the response sizes varied - measured by standard deviation. Pages with uniform content have low variation while pages mixing small scripts and large images have high variation, creating a distinctive signature',
-            'mean_out_pkts': 'the average number of network packets per request burst. This low-level detail about how data gets packaged reveals protocol-level behavior that differs subtly but measurably between page types',
-            'mean_in_pkts': 'the average number of network packets per response burst. How the server chunks its responses into packets is a technical signature - some servers are consistent, others vary based on content type',
-            'mean_out_dur': 'the average time each outgoing burst took to send. This timing pattern captures both your connection speed and how the page spaces its requests - some pages wait between requests, others fire rapidly',
-            'mean_in_dur': 'the average time each incoming burst took to arrive. This duration reveals the server\'s delivery speed and content streaming behavior - fast servers with small chunks have short durations, slower ones with large content take longer',
-        }
-        
-        # Return explanation if available, otherwise create a generic one
-        if feature_name in explanations:
-            return explanations[feature_name]
-        else:
-            # Generic fallback for any features not in the dictionary
-            return f'the "{feature_name}" characteristic of your traffic pattern'
-    
-    def _build_feature_analysis(self, label: str, proba: float | None, margin: float | None, importance_df: pd.DataFrame) -> str:
-        """Build user-friendly feature analysis showing what exposed the traffic."""
-        lines = []
-        
-        # Check if prediction is accepted or rejected
-        accepted = True
-        if proba is None:
-            accepted = True
-        elif self.monitored_labels is not None and label not in self.monitored_labels:
-            accepted = False
-        elif proba < self.confidence_threshold:
-            accepted = False
-        elif margin is not None and margin < self.margin_threshold:
-            accepted = False
-            
-        # For rejected predictions, show rejection message
-        if not accepted:
-            lines.append("=" * 80)
-            lines.append(f"NO MONITORED SITE DETECTED")
-            lines.append(f"Decision: REJECTED")
-            lines.append("")
-            lines.append("Monitored sites:")
-            for site in sorted(self.monitored_labels or []):
-                lines.append(f"  • {site}")
-            lines.append("=" * 80)
-            return "\n".join(lines)
-        
-        # For accepted predictions, show only feature explanations (no header)
-        # Get top 2 features only
-        top_features = importance_df.head(2)
-        
-        if len(top_features) >= 1:
-            first_feat = top_features.iloc[0]
-            explanation = self._get_feature_explanation(first_feat['feature'])
-            lines.append(f"What exposed your traffic the most is {explanation}.")
-            lines.append("")
-        
-        if len(top_features) >= 2:
-            second_feat = top_features.iloc[1]
-            explanation = self._get_feature_explanation(second_feat['feature'])
-            lines.append(f"The second most revealing aspect is {explanation}.")
-            lines.append("")
-        
-        return "\n".join(lines)
-    
-    def _display_analysis(self, analysis: str, importance_df: pd.DataFrame = None):
-        """Update the feature text area with analysis results."""
-        # Store data for toggle functionality
-        self.current_simple_text = analysis
-        self.current_technical_data = importance_df
-        self.show_technical = False  # Reset to collapsed state
-        
-        # Update button state
-        if importance_df is not None and not importance_df.empty:
-            self.btn_toggle_technical.config(state=tk.NORMAL, text="Show technical details ▲")
-        else:
-            self.btn_toggle_technical.config(state=tk.DISABLED)
-        
-        # Display simple text only
-        self.feature_text.config(state=tk.NORMAL)
-        self.feature_text.delete("1.0", tk.END)
-        self.feature_text.insert("1.0", analysis)
-        self.feature_text.config(state=tk.DISABLED)
-    
-    def toggle_technical_details(self):
-        """Toggle between simple explanations and detailed technical feature data."""
-        if self.current_technical_data is None:
+    def _display_result(self, capture, prediction, prediction_error, filename, cleanup_error=None):
+        self.capture_data = capture
+        self.inspector.set_capture(capture)
+        self.feature_table.delete(*self.feature_table.get_children())
+        self.status_var.set(f'{filename} · {len(capture.packets):,} packets · '
+                            f'{len(capture.bursts):,} bursts · {len(capture.pairs):,} model pairs')
+        if cleanup_error:
+            self.status_var.set(self.status_var.get() + ' · ' + cleanup_error)
+        if prediction_error:
+            self.prediction_var.set('Prediction unavailable')
+            self.prediction_detail_var.set(prediction_error + ' Traffic inspection is still available.')
             return
-        
-        self.show_technical = not self.show_technical
-        
-        self.feature_text.config(state=tk.NORMAL)
-        self.feature_text.delete("1.0", tk.END)
-        
-        if self.show_technical:
-            # Show simple text + technical details
-            self.feature_text.insert("1.0", self.current_simple_text)
-            self.feature_text.insert(tk.END, "\n" + "═" * 80 + "\n")
-            self.feature_text.insert(tk.END, "TECHNICAL DETAILS - Feature Importance Ranking:\n")
-            self.feature_text.insert(tk.END, "─" * 80 + "\n\n")
-            
-            for idx, row in self.current_technical_data.iterrows():
-                feat_name = row['feature']
-                importance = row['importance']
-                value = row['value']
-                # Reverse log1p transform to show original value
-                original_value = np.expm1(value)
-                self.feature_text.insert(
-                    tk.END,
-                    f"{feat_name:30s}  importance: {importance:6.4f}  value: {original_value:12.2f}\n"
-                )
-            
-            self.btn_toggle_technical.config(text="Hide technical details ▼")
+        if not prediction['available']:
+            self.prediction_var.set('Prediction unavailable')
+            self.prediction_detail_var.set(prediction['reason'])
+            return
+        label = prediction['label']
+        confidence = prediction['confidence']
+        score = f' · Confidence: {confidence:.1%}' if confidence is not None else ''
+        self.prediction_var.set(f'Model prediction: {label}{score}')
+        if prediction['accepted']:
+            decision = 'Monitored page detected.' if self.monitored_labels is not None else 'Prediction accepted.'
         else:
-            # Show simple text only
-            self.feature_text.insert("1.0", self.current_simple_text)
-            self.btn_toggle_technical.config(text="Show technical details ▲")
-        
-        self.feature_text.config(state=tk.DISABLED)
+            decision = 'No monitored site detected. ' + prediction['reason']
+        gap = f' Top-two probability gap: {prediction["margin"]:.1%}.' if prediction['margin'] is not None else ''
+        self.prediction_detail_var.set(decision + gap)
+        for name, value, importance in sorted(prediction['features'], key=lambda feature: feature[2], reverse=True):
+            self.feature_table.insert('', 'end', values=(name, f'{value:,.6g}', f'{importance:.4f}'))
 
     def _cleanup_files(self, pcap_path: str, pairs_path: Path | str):
-        # Also attempt to remove the per-packet CSV if present (<pcap>_dir.csv)
+        """Only delete files from this live capture; its metadata stays in memory."""
         pcap = Path(pcap_path)
-        pairs = Path(pairs_path)
-        dir_csv = pcap.with_name(pcap.stem + "_dir.csv")
-        for p in [pairs, dir_csv, pcap]:
+        errors = []
+        for path in (Path(pairs_path), pcap.with_name(pcap.stem + '_dir.csv'), pcap):
             try:
-                if p.exists():
-                    os.remove(p)
-            except Exception:
-                # Ignore cleanup errors silently
-                pass
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                errors.append(f'{path.name}: {error}')
+        return 'Temporary file cleanup failed: ' + '; '.join(errors) if errors else None
 
-    # Example extension point for periodic UI updates (timer/counter)
-    # def _tick(self):
-    #     if self.proc is not None and self.proc.poll() is None:
-    #         # Update timer, counter, etc.
-    #         pass
-    #     self.after(1000, self._tick)
+    def on_close(self):
+        self.closing = True
+        if self.proc is not None:
+            stop_capture(self.proc)
+        self.destroy()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="HTTPS Traffic Capture GUI")
-    parser.add_argument("--interface", default="en1", help="Network interface (default: en0)")
-    parser.add_argument("--model", help="Path to model bundle (.joblib file)")
-    parser.add_argument("--accept-all-labels", action="store_true", help="Accept any labels from model (for testing unstable models)")
-    parser.add_argument("--accept-labels", nargs="+", help="Accept only these specific labels (space-separated, e.g., --accept-labels apple amazon)")
+def main():
+    parser = argparse.ArgumentParser(description='HTTPS traffic inspection and Random Forest prediction')
+    parser.add_argument('--interface', default='en1', help='Capture interface (default: en1)')
+    parser.add_argument('--model', help='Path to a trusted model bundle (.joblib file)')
+    parser.add_argument('--out-dir', help='Directory for temporary live capture files')
+    parser.add_argument('--accept-all-labels', action='store_true', help='Accept every model label')
+    parser.add_argument('--accept-labels', nargs='+', help='Monitored labels to accept')
+    parser.add_argument('--pcap', help='Open an existing capture without starting live capture')
+    parser.add_argument('--local-ip', nargs='+', help='Client IP address(es) recorded in --pcap')
     args = parser.parse_args()
-    
-    app = CaptureApp(interface=args.interface, model_path=args.model, accept_all_labels=args.accept_all_labels, accept_labels=args.accept_labels)
+    if args.pcap and not args.local_ip:
+        parser.error('--pcap requires --local-ip to label historical packet direction correctly')
+    ips = None
+    if args.pcap:
+        try:
+            ips = parse_client_ips(' '.join(args.local_ip))
+        except ValueError as error:
+            parser.error(str(error))
+    app = CaptureApp(interface=args.interface, out_dir=args.out_dir, model_path=args.model,
+                     accept_all_labels=args.accept_all_labels, accept_labels=args.accept_labels)
+    if args.pcap:
+        app.after(100, lambda: app.open_capture(args.pcap, ips))
     app.mainloop()
-1
+
+
+if __name__ == '__main__':
+    main()

@@ -67,8 +67,8 @@ def read_pairs_csv(path: Path) -> pd.DataFrame:
 
 # --- N-GRAM FEATURE EXTRACTION ---
 # Thresholds determined from analyze_thresholds.py (median-based split)
-OUT_SMALL_THRESHOLD = 11450
-IN_SMALL_THRESHOLD = 167
+OUT_SMALL_THRESHOLD = 66
+IN_SMALL_THRESHOLD = 37650
 
 
 def extract_ngram_features(df: pd.DataFrame) -> dict:
