@@ -24,7 +24,10 @@ Example capture command (what this script constructs and runs under the hood):
 import os                      # for file paths, directories, and environment queries
 import shutil                  # to check if tshark is available on PATH
 import subprocess              # to run external commands (like tshark)
-from datetime import datetime  # to generate timestamped filenames
+import tempfile
+import time
+from datetime import datetime, timezone  # to generate timestamped filenames
+from pathlib import Path
 import signal                  # to send signals when stopping background capture
 
 
@@ -66,7 +69,7 @@ def build_pcap_path(out_dir: str, prefix: str = "safari") -> str:
         Absolute path to the pcap file, e.g., /Users/me/wf_traces/safari_20251027T113500Z.pcap
     """
     # Use UTC time for consistent ordering across machines/time zones.
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     # Compose a filename like safari_20251027T113500Z.pcap.
     filename = f"{prefix}_{timestamp}.pcap"
     # Join the directory and filename into an absolute path.
@@ -87,7 +90,7 @@ def check_tshark_available() -> None:
         )
 
 
-def build_tshark_cmd(interface: str, seconds: int, pcap_path: str, bpf_filter: str = HTTPS_BPF_FILTER) -> list:
+def build_tshark_cmd(interface: str, seconds: float, pcap_path: str, bpf_filter: str = HTTPS_BPF_FILTER) -> list:
     """Build the tshark command that captures only HTTPS traffic for a fixed duration.
 
     Args:
@@ -111,19 +114,48 @@ def build_tshark_cmd(interface: str, seconds: int, pcap_path: str, bpf_filter: s
 
 
 # ----------------------- Flexible capture API -----------------------
+def _wait_for_capture_ready(proc: subprocess.Popen, pcap_path: str,
+                            timeout: float) -> None:
+    """Wait for dumpcap's flushed file header, without requiring any packets.
+
+    Starting a process alone does not mean it has opened the interface yet.
+    Dumpcap writes and flushes this header after opening the interface and
+    installing the capture filter. Support both pcap and tshark's default pcapng.
+    """
+    deadline = time.monotonic() + timeout
+    pcap_magic = {b'\xd4\xc3\xb2\xa1', b'\xa1\xb2\xc3\xd4',
+                  b'\x4d\x3c\xb2\xa1', b'\xa1\xb2\x3c\x4d'}
+    while True:
+        if proc.poll() is not None:
+            raise RuntimeError(f"tshark exited during startup (code {proc.returncode}).")
+        try:
+            with open(pcap_path, 'rb') as capture_file:
+                header = capture_file.read(28)
+            if ((len(header) >= 24 and header[:4] in pcap_magic) or
+                    (len(header) >= 28 and header[:4] == b'\x0a\x0d\x0d\x0a')):
+                return
+        except FileNotFoundError:
+            pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"tshark did not become ready within {timeout:g} seconds.")
+        time.sleep(0.05)
+
+
 def start_capture(interface: str,
                   out_dir: str,
                   prefix: str = "safari",
-                  duration: int | None = None,
-                  fixed: bool = False):
+                  duration: float | None = None,
+                  fixed: bool = False,
+                  startup_timeout: float = 10.0):
     """Start a capture in either fixed-duration or manual (start/stop) mode.
 
     Behavior
     --------
     - When fixed is True and duration is provided: runs tshark with
       "-a duration:<seconds>" and blocks until completion. Returns (None, pcap_path).
-    - When fixed is False: starts a background capture (no auto-stop) using Popen
-      and returns (proc, pcap_path) so callers can stop it later via stop_capture().
+    - When fixed is False: starts a background capture (no auto-stop), waits for
+      its file header, and returns (proc, pcap_path). Navigation can then start
+      safely; callers must stop the capture later via stop_capture().
 
     Args:
         interface: Network interface to capture on (e.g., "en0").
@@ -131,6 +163,7 @@ def start_capture(interface: str,
         prefix:    Filename prefix for the pcap.
         duration:  Duration in seconds for fixed-duration mode.
         fixed:     If True, block for a fixed duration; else run in background.
+        startup_timeout: Maximum wait for background capture to become ready.
 
     Returns:
         Tuple[proc|None, str]: (subprocess.Popen or None, pcap_path)
@@ -166,13 +199,25 @@ def start_capture(interface: str,
     print(f"[+] Writing to: {pcap_path}")
     print(f"[+] Command: {' '.join(cmd)}")
 
-    # Start tshark in its own process group so we can stop it cleanly via os.killpg.
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid,  # create a new session/process group (POSIX/macOS)
-    )
+    # A file avoids a full stderr pipe blocking a long-running capture. Keep
+    # startup diagnostics available if the interface or permissions are wrong.
+    with tempfile.TemporaryFile() as diagnostics:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=diagnostics,
+            start_new_session=True,
+        )
+        try:
+            _wait_for_capture_ready(proc, pcap_path, startup_timeout)
+        except BaseException as exc:
+            stop_capture(proc)
+            Path(pcap_path).unlink(missing_ok=True)
+            if isinstance(exc, Exception):
+                diagnostics.seek(0)
+                detail = diagnostics.read().decode('utf-8', errors='replace').strip()
+                raise RuntimeError(f"Could not start capture: {exc}\n{detail}".strip()) from exc
+            raise
     return proc, pcap_path
 
 

@@ -97,7 +97,7 @@ def get_local_ips(iface: str) -> set[str]:
     return addrs
 
 
-def run_tshark_fields(pcap_path: str) -> list:
+def run_tshark_fields(pcap_path: str, *, include_ports: bool = False) -> list:
     """Use tshark to extract useful packet fields from the .pcap.
 
         We output these columns:
@@ -126,6 +126,9 @@ def run_tshark_fields(pcap_path: str) -> list:
     "-E", "quote=n",
     "-E", "occurrence=f",
     ]
+    if include_ports:
+        for field in ('tcp.srcport', 'tcp.dstport', 'udp.srcport', 'udp.dstport'):
+            cmd.extend(['-e', field])
 
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True)

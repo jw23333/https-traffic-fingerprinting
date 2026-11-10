@@ -66,12 +66,15 @@ def read_pairs_csv(path: Path) -> pd.DataFrame:
 
 
 # --- N-GRAM FEATURE EXTRACTION ---
-# Thresholds determined from analyze_thresholds.py (median-based split)
+# Median boundaries from the 2026-10-16 force-reload collection (20,071 pairs).
+# The training partition alone gives the same values. Retrain after changing them.
 OUT_SMALL_THRESHOLD = 66
-IN_SMALL_THRESHOLD = 37650
+IN_SMALL_THRESHOLD = 31626
 
 
-def extract_ngram_features(df: pd.DataFrame) -> dict:
+def extract_ngram_features(df: pd.DataFrame, *,
+                           out_small_threshold: float = OUT_SMALL_THRESHOLD,
+                           in_small_threshold: float = IN_SMALL_THRESHOLD) -> dict:
     """Extract sequential n-gram features from burst pairs.
     
     Features are position-independent (counts/ratios), allowing Random Forest
@@ -81,9 +84,9 @@ def extract_ngram_features(df: pd.DataFrame) -> dict:
         return _empty_ngram_features()
     
     # Classify each burst pair as small/large for out and in
-    out_classes = ['S' if row['out_bytes'] <= OUT_SMALL_THRESHOLD else 'L' 
+    out_classes = ['S' if row['out_bytes'] <= out_small_threshold else 'L'
                    for _, row in df.iterrows()]
-    in_classes = ['S' if row['in_bytes'] <= IN_SMALL_THRESHOLD else 'L' 
+    in_classes = ['S' if row['in_bytes'] <= in_small_threshold else 'L'
                   for _, row in df.iterrows()]
     
     features = {}
@@ -164,13 +167,15 @@ def _empty_ngram_features() -> dict:
     return features
 
 
-def summary_features(df: pd.DataFrame) -> dict:
+def summary_features(df: pd.DataFrame, *,
+                     out_small_threshold: float = OUT_SMALL_THRESHOLD,
+                     in_small_threshold: float = IN_SMALL_THRESHOLD) -> dict:
     """Extract aggregate statistics + sequential n-gram features from burst pairs.
     
     Returns a dict combining:
     - 12 original aggregate features (totals, means, stds, ratio)
-    - 28 n-gram features (bigrams, trigrams, counts, ratios)
-    Total: 40 features
+    - 24 size-category features (bigrams, trigrams, counts, ratios)
+    Total: 36 features
     """
     # safe conversions
     if df.empty:
@@ -217,7 +222,8 @@ def summary_features(df: pd.DataFrame) -> dict:
     }
     
     # Add n-gram features
-    base_feats.update(extract_ngram_features(df))
+    base_feats.update(extract_ngram_features(
+        df, out_small_threshold=out_small_threshold, in_small_threshold=in_small_threshold))
     
     return base_feats
 
@@ -329,10 +335,18 @@ def train_and_evaluate(X: pd.DataFrame, y: pd.Series, test_size: float, out_mode
     plot_confusion_matrix_figure(cm, list(le.classes_), cm_plot_path)
     print(f"Saved confusion matrix plot to: {cm_plot_path}")
 
-    # Save model + encoder + feature names
+    # Record the boundaries with the model so its feature definition is traceable.
     out_model = Path(out_model)
     out_model.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({'model': clf, 'label_encoder': le, 'feature_names': list(X.columns)}, out_model)
+    joblib.dump({
+        'model': clf,
+        'label_encoder': le,
+        'feature_names': list(X.columns),
+        'burst_size_thresholds': {
+            'out_bytes': OUT_SMALL_THRESHOLD,
+            'in_bytes': IN_SMALL_THRESHOLD,
+        },
+    }, out_model)
     print(f"Saved model bundle to: {out_model}")
 
 
